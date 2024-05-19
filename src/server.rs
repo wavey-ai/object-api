@@ -1,8 +1,11 @@
+use crate::presigned::{generate_presigned_url, verify_presigned_url};
+use bytes::Buf;
 use bytes::Bytes;
+use futures::task::{Context, Poll};
 use h3::server::RequestStream;
-use http::header::CONTENT_TYPE;
 use http::{Method, Request, Response, StatusCode};
 use http_body_util::Full;
+use hyper::body::Body;
 use hyper::body::Incoming;
 use hyper::service::service_fn;
 use hyper_idp::client::get_profile;
@@ -14,31 +17,40 @@ use rustls::{Certificate, PrivateKey};
 use rustls_pemfile::{certs, pkcs8_private_keys};
 use std::net::{Ipv4Addr, SocketAddr};
 use std::path::Path;
+use std::pin::Pin;
 use std::sync::Arc;
 use std::{fs::File, io, io::BufReader};
+use storage::Storage;
+use svix_ksuid::*;
 use tokio::net::TcpListener;
+use tokio::sync::broadcast;
 use tokio::sync::watch;
 use tokio_rustls::TlsAcceptor;
 use tracing::{error, info};
+use url::Url;
 
+const EXPIRY_SECONDS: u64 = 3600;
+const ISSUE_PRESIGNED_URL_PATH: &str = "/presigned";
 const UPLOAD_PATH: &str = "/upload";
-const PROFILE_PATH: &str = "/profile";
-const LIST_PATH: &str = "/list";
+const UPLOADS_BUCKET_NAME: &str = "uploads";
+const UP_PATH: &str = "/up";
 
 pub struct ObjectApi {
     ssl_port: u16,
     ssl_path: String,
     client: reqwest::Client,
     idp_port: u16,
+    storage: Storage,
 }
 
 impl ObjectApi {
-    pub fn new(ssl_path: String, ssl_port: u16, idp_port: u16) -> Self {
+    pub fn new(ssl_path: String, ssl_port: u16, idp_port: u16, storage: Storage) -> Self {
         Self {
             ssl_path,
             ssl_port,
             client: Client::new(),
             idp_port,
+            storage,
         }
     }
 
@@ -69,13 +81,15 @@ impl ObjectApi {
 
         let client = self.client.clone();
         let idp_port = self.idp_port;
+        let storage = self.storage.clone();
         let srv_h2 = {
             let mut shutdown_signal = rx.clone();
 
             async move {
                 let incoming = TcpListener::bind(&addr).await.unwrap();
-                let service =
-                    service_fn(move |req| handle_request_h2(req, client.clone(), idp_port));
+                let service = service_fn(move |req| {
+                    handle_request_h2(req, client.clone(), idp_port, storage.clone())
+                });
 
                 loop {
                     tokio::select! {
@@ -141,6 +155,7 @@ impl ObjectApi {
             let endpoint = quinn::Endpoint::server(server_config, addr).unwrap();
 
             let client = self.client.clone();
+            let storage = self.storage.clone();
             let srv_h3 = {
                 let mut shutdown_signal = rx.clone();
 
@@ -154,6 +169,7 @@ impl ObjectApi {
                                 if let Some(new_conn) = res {
                                     info!("New connection being attempted");
                                     let client = client.clone();
+                                    let storage = storage.clone();
                                     tokio::spawn(async move {
                                         match new_conn.await {
                                             Ok(conn) => {
@@ -165,8 +181,9 @@ impl ObjectApi {
                                                     match h3_conn.accept().await {
                                                         Ok(Some((req, stream))) => {
                                                             let client = client.clone();
+                                                            let storage = storage.clone();
                                                             tokio::spawn(async move {
-                                                                if let Err(err) = handle_connection_h3(req, stream, client, idp_port).await {
+                                                                if let Err(err) = handle_connection_h3(req, stream, client, idp_port, storage).await {
                                                                     error!("Failed to handle connection: {err:?}");
                                                                 }
                                                             });
@@ -206,37 +223,117 @@ async fn request_handler(
     uri: &http::Uri,
     client: reqwest::Client,
     idp_port: u16,
-) -> Result<(http::response::Builder, Option<Bytes>), Box<dyn std::error::Error + Send + Sync>> {
+) -> Result<
+    (http::response::Builder, Option<Bytes>, Option<String>),
+    Box<dyn std::error::Error + Send + Sync>,
+> {
     let mut res = http::Response::builder();
     let mut body = None;
+    let mut object_key = None;
     match (method, uri.path()) {
-        (&Method::POST, UPLOAD_PATH) => {
+        (&Method::GET, UP_PATH) => {
             res = res.status(StatusCode::OK);
         }
-        (&Method::GET, PROFILE_PATH) => {
-            match get_profile(client.clone(), headers, idp_port).await {
-                Ok(user) => {
-                    if let Ok(json_response) = serde_json::to_string(&user) {
-                        let body_bytes = Bytes::from(json_response);
-                        res = res
-                            .status(StatusCode::OK)
-                            .header(CONTENT_TYPE, "application/json");
-                        body = Some(body_bytes);
+        (&Method::POST, UPLOAD_PATH) => {
+            if let Some(q) = uri.query() {
+                match verify_presigned_url(q) {
+                    Ok(_) => {
+                        let parsed_url = Url::parse(q)?;
+                        let query_pairs = parsed_url.query_pairs();
+
+                        for (key, value) in query_pairs {
+                            if key == "file" {
+                                object_key = Some(value.to_string());
+                                res = res.status(StatusCode::OK);
+                            }
+                        }
+                    }
+                    Err(_) => {
+                        res = res.status(StatusCode::FORBIDDEN);
                     }
                 }
-                Err(e) => {
-                    dbg!(e);
+            } else {
+                res = res.status(StatusCode::BAD_REQUEST);
+            }
+        }
+        (&Method::POST, ISSUE_PRESIGNED_URL_PATH) => {
+            match get_profile(client.clone(), headers, idp_port).await {
+                Ok(user) => {
+                    let ksuid = Ksuid::new(None, None);
+                    let path = format!("{}?{}", user.id(), ksuid);
+                    match generate_presigned_url(&path, EXPIRY_SECONDS) {
+                        Ok(query_string) => {
+                            let base_url = "/upload";
+                            let full_uri = Bytes::from(format!("{}?{}", base_url, query_string));
+                            body = Some(full_uri);
+                        }
+                        Err(e) => error!("Error generating presigned URL: {}", e),
+                    }
+                    res = res.status(StatusCode::OK);
+                }
+                Err(_) => {
+                    res = res.status(StatusCode::FORBIDDEN);
                 }
             };
-
-            res = res.status(StatusCode::OK);
         }
         _ => {
             res = res.status(StatusCode::NOT_FOUND);
         }
     };
 
-    Ok((res, body))
+    Ok((res, body, object_key))
+}
+
+async fn handle_request_h2(
+    req: Request<Incoming>,
+    client: reqwest::Client,
+    idp_port: u16,
+    storage: Storage,
+) -> Result<Response<Full<Bytes>>, Box<dyn std::error::Error + Send + Sync>> {
+    let (res, body, object_key) =
+        request_handler(req.method(), req.headers(), req.uri(), client, idp_port).await?;
+
+    if let Some(b) = body {
+        Ok(res.body(Full::new(b)).unwrap())
+    } else if req.method() == Method::POST && req.uri().path() == UPLOAD_PATH {
+        if let Some(object_key) = object_key {
+            let (tx, rx) = broadcast::channel(100);
+            tokio::spawn(async move {
+                let mut body = req.into_body();
+                let mut pinned_body = Pin::new(&mut body);
+                while let Poll::Ready(Some(result)) = pinned_body
+                    .as_mut()
+                    .poll_frame(&mut Context::from_waker(futures::task::noop_waker_ref()))
+                {
+                    match result {
+                        Ok(frame) => {
+                            if let Ok(chunk) = frame.into_data() {
+                                if tx.send(chunk).is_err() {
+                                    break;
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            error!("Error reading chunk: {:?}", e);
+                            break;
+                        }
+                    }
+                }
+                if let Err(e) = storage.upload(UPLOADS_BUCKET_NAME, &object_key, rx).await {
+                    error!("Error during upload: {:?}", e);
+                }
+            });
+
+            Ok(res.body(Full::new(Bytes::new())).unwrap())
+        } else {
+            Ok(res
+                .status(StatusCode::BAD_REQUEST)
+                .body(Full::new(Bytes::new()))
+                .unwrap())
+        }
+    } else {
+        Ok(res.body(Full::new(Bytes::new())).unwrap())
+    }
 }
 
 async fn handle_connection_h3(
@@ -244,44 +341,41 @@ async fn handle_connection_h3(
     mut stream: RequestStream<h3_quinn::BidiStream<Bytes>, Bytes>,
     client: reqwest::Client,
     idp_port: u16,
+    storage: Storage,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    match request_handler(req.method(), req.headers(), req.uri(), client, idp_port).await {
-        Ok((res, body)) => {
-            let initial_response = res.body(()).unwrap();
-            if let Err(err) = stream.send_response(initial_response).await {
-                error!("unable to send response to connection peer: {:?}", err);
-            }
+    let (res, body, object_key) =
+        request_handler(req.method(), req.headers(), req.uri(), client, idp_port).await?;
 
-            if let Some(body) = body {
-                if let Err(err) = stream.send_data(body).await {
-                    error!("unable to send body data to connection peer: {:?}", err);
+    if let Some(b) = body {
+        stream.send_response(res.body(()).unwrap()).await?;
+        stream.send_data(b).await?;
+    } else if req.method() == Method::POST && req.uri().path() == UPLOAD_PATH {
+        if let Some(object_key) = object_key {
+            let (tx, rx) = broadcast::channel::<Bytes>(100);
+            let storage_clone = storage.clone();
+            while let Ok(Some(mut data)) = stream.recv_data().await {
+                let bytes = data.copy_to_bytes(data.remaining());
+                if tx.send(bytes).is_err() {
+                    break;
                 }
             }
+            if let Err(e) = storage_clone
+                .upload(UPLOADS_BUCKET_NAME, &object_key, rx)
+                .await
+            {
+                error!("Error during upload: {:?}", e);
+            }
+            stream.send_response(res.body(()).unwrap()).await?;
+        } else {
+            stream
+                .send_response(res.status(StatusCode::BAD_REQUEST).body(()).unwrap())
+                .await?;
         }
-        Err(err) => {
-            error!("unable to send response to connection peer: {:?}", err);
-        }
-    }
-
-    if let Err(err) = stream.finish().await {
-        error!("unable to finish stream: {:?}", err);
-    }
-
-    Ok(())
-}
-
-async fn handle_request_h2(
-    req: http::Request<Incoming>,
-    client: reqwest::Client,
-    idp_port: u16,
-) -> Result<Response<Full<Bytes>>, Box<dyn std::error::Error + Send + Sync>> {
-    let (res, body) =
-        request_handler(req.method(), req.headers(), req.uri(), client, idp_port).await?;
-    if let Some(b) = body {
-        Ok(res.body(Full::new(b)).unwrap())
     } else {
-        Ok(res.body(Full::new(Bytes::new())).unwrap())
+        stream.send_response(res.body(()).unwrap()).await?;
     }
+    stream.finish().await?;
+    Ok(())
 }
 
 fn load_certs(path: &Path) -> io::Result<Vec<CertificateDer<'static>>> {
