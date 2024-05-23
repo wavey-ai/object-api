@@ -24,14 +24,15 @@ pki-types = { package = "rustls-pki-types", version = "1.4.1" }
 jsonwebtoken = "9.3.0"
 serde_json = "1.0.117"
 cookie = "0.18.1"
-h3-quinn = { git = "https://github.com/hyperium/h3.git" }
+h3-quinn = { git = "https://github.com/hyperium/h3.git", rev = "eb79204" }
 quinn = { version = "0.10", default-features = false, features = [
   "runtime-tokio",
   "tls-rustls",
   "ring",
 ] }
-h3 = { git = "https://github.com/hyperium/h3.git" }
-storage = { git = "https://github.com/wavey-ai/storage" }
+h3 = { git = "https://github.com/hyperium/h3.git", rev = "eb79204" }
+#storage = { git = "https://github.com/wavey-ai/storage" }
+storage = { path = "../storage" }
 futures = "0.3.30"
 hmac = "0.12.1"
 sha2 = "0.10.8"
@@ -39,3 +40,4 @@ base64 = "0.22.1"
 url = "2.5.0"
 thiserror = "1.0.61"
 svix-ksuid = "0.8.0"
+anyhow = "1.0.86"

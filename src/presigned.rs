@@ -29,6 +29,10 @@ pub enum VerificationError {
     MissingExpiryParameter,
     #[error("Missing signature parameter")]
     MissingSignatureParameter,
+    #[error("Bad signature")]
+    BadSignature,
+    #[error("LinkExpired")]
+    LinkExpired,
     #[error("Invalid expiry time")]
     InvalidExpiryTime(#[from] std::num::ParseIntError),
     #[error("Time went backwards")]
@@ -57,8 +61,8 @@ pub(crate) fn generate_presigned_url(
     Ok(query)
 }
 
-pub(crate) fn verify_presigned_url(url: &str) -> Result<bool, VerificationError> {
-    let parsed_url = Url::parse(url)?;
+pub(crate) fn verify_presigned_url(params: &str) -> Result<String, VerificationError> {
+    let parsed_url = Url::parse(&format!("http://example.com?{}", params))?;
     let query_pairs = parsed_url.query_pairs();
 
     let mut file_path = None;
@@ -83,7 +87,7 @@ pub(crate) fn verify_presigned_url(url: &str) -> Result<bool, VerificationError>
     let current_time = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
 
     if current_time > expiry_time {
-        return Ok(false); // URL has expired
+        return Err(VerificationError::LinkExpired);
     }
 
     let to_sign = format!("{}:{}", file_path, expiry_time);
@@ -91,5 +95,9 @@ pub(crate) fn verify_presigned_url(url: &str) -> Result<bool, VerificationError>
     mac.update(to_sign.as_bytes());
     let expected_signature = URL_SAFE.encode(mac.finalize().into_bytes());
 
-    Ok(expected_signature == signature)
+    if (expected_signature != signature) {
+        Err(VerificationError::BadSignature)
+    } else {
+        Ok(file_path)
+    }
 }

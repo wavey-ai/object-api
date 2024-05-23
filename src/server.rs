@@ -1,11 +1,11 @@
 use crate::presigned::{generate_presigned_url, verify_presigned_url};
+use anyhow::{anyhow, Context, Result};
 use bytes::Buf;
 use bytes::Bytes;
-use futures::task::{Context, Poll};
+use futures::stream::StreamExt;
 use h3::server::RequestStream;
 use http::{Method, Request, Response, StatusCode};
-use http_body_util::Full;
-use hyper::body::Body;
+use http_body_util::{BodyStream, Full};
 use hyper::body::Incoming;
 use hyper::service::service_fn;
 use hyper_idp::client::get_profile;
@@ -17,23 +17,21 @@ use rustls::{Certificate, PrivateKey};
 use rustls_pemfile::{certs, pkcs8_private_keys};
 use std::net::{Ipv4Addr, SocketAddr};
 use std::path::Path;
-use std::pin::Pin;
 use std::sync::Arc;
 use std::{fs::File, io, io::BufReader};
 use storage::Storage;
 use svix_ksuid::*;
 use tokio::net::TcpListener;
-use tokio::sync::broadcast;
 use tokio::sync::watch;
+use tokio::sync::{broadcast, mpsc};
 use tokio_rustls::TlsAcceptor;
 use tracing::{error, info};
-use url::Url;
 
 const EXPIRY_SECONDS: u64 = 3600;
-const ISSUE_PRESIGNED_URL_PATH: &str = "/presigned";
-const UPLOAD_PATH: &str = "/upload";
+const ISSUE_PRESIGNED_URL_PATH: &str = "presigned";
+const UPLOAD_PATH: &str = "upload";
 const UPLOADS_BUCKET_NAME: &str = "uploads";
-const UP_PATH: &str = "/up";
+const UP_PATH: &str = "up";
 
 pub struct ObjectApi {
     ssl_port: u16,
@@ -221,34 +219,34 @@ async fn request_handler(
     method: &Method,
     headers: &http::HeaderMap,
     uri: &http::Uri,
-    client: reqwest::Client,
+    client: Client,
     idp_port: u16,
-) -> Result<
-    (http::response::Builder, Option<Bytes>, Option<String>),
-    Box<dyn std::error::Error + Send + Sync>,
-> {
+) -> Result<(http::response::Builder, Option<Bytes>, Option<String>)> {
     let mut res = http::Response::builder();
     let mut body = None;
     let mut object_key = None;
-    match (method, uri.path()) {
+
+    let keys: Vec<&str> = uri.path().split('/').filter(|s| !s.is_empty()).collect();
+
+    match (method, keys[0]) {
         (&Method::GET, UP_PATH) => {
             res = res.status(StatusCode::OK);
         }
+        (&Method::GET, UPLOAD_PATH) => {
+            if keys.len() == 3 {
+                object_key = Some(format!("{}/{}", keys[1], keys[2]));
+            }
+        }
+
         (&Method::POST, UPLOAD_PATH) => {
             if let Some(q) = uri.query() {
                 match verify_presigned_url(q) {
-                    Ok(_) => {
-                        let parsed_url = Url::parse(q)?;
-                        let query_pairs = parsed_url.query_pairs();
-
-                        for (key, value) in query_pairs {
-                            if key == "file" {
-                                object_key = Some(value.to_string());
-                                res = res.status(StatusCode::OK);
-                            }
-                        }
+                    Ok(key) => {
+                        object_key = Some(key);
+                        res = res.status(StatusCode::OK);
                     }
-                    Err(_) => {
+                    Err(e) => {
+                        error!("error verifying presigned url: {}", e);
                         res = res.status(StatusCode::FORBIDDEN);
                     }
                 }
@@ -257,10 +255,10 @@ async fn request_handler(
             }
         }
         (&Method::POST, ISSUE_PRESIGNED_URL_PATH) => {
-            match get_profile(client.clone(), headers, idp_port).await {
+            match get_profile(client, headers, idp_port).await {
                 Ok(user) => {
                     let ksuid = Ksuid::new(None, None);
-                    let path = format!("{}?{}", user.id(), ksuid);
+                    let path = format!("{}/{}", user.id(), ksuid);
                     match generate_presigned_url(&path, EXPIRY_SECONDS) {
                         Ok(query_string) => {
                             let base_url = "/upload";
@@ -286,104 +284,177 @@ async fn request_handler(
 
 async fn handle_request_h2(
     req: Request<Incoming>,
-    client: reqwest::Client,
+    client: Client,
     idp_port: u16,
     storage: Storage,
-) -> Result<Response<Full<Bytes>>, Box<dyn std::error::Error + Send + Sync>> {
+) -> Result<Response<Full<Bytes>>> {
     let (res, body, object_key) =
         request_handler(req.method(), req.headers(), req.uri(), client, idp_port).await?;
 
+    let keys: Vec<&str> = req
+        .uri()
+        .path()
+        .split('/')
+        .filter(|s| !s.is_empty())
+        .collect();
+
     if let Some(b) = body {
         Ok(res.body(Full::new(b)).unwrap())
-    } else if req.method() == Method::POST && req.uri().path() == UPLOAD_PATH {
-        if let Some(object_key) = object_key {
-            let (tx, rx) = broadcast::channel(100);
-            tokio::spawn(async move {
-                let mut body = req.into_body();
-                let mut pinned_body = Pin::new(&mut body);
-                while let Poll::Ready(Some(result)) = pinned_body
-                    .as_mut()
-                    .poll_frame(&mut Context::from_waker(futures::task::noop_waker_ref()))
-                {
-                    match result {
-                        Ok(frame) => {
-                            if let Ok(chunk) = frame.into_data() {
-                                if tx.send(chunk).is_err() {
-                                    break;
+    } else {
+        match (req.method(), keys[0]) {
+            (&Method::GET, UPLOAD_PATH) => {
+                let range_header = req
+                    .headers()
+                    .get("range")
+                    .ok_or_else(|| anyhow!("Range header missing"))?;
+                let range_str = range_header
+                    .to_str()
+                    .context("Failed to convert range header to string")?;
+                let range = parse_byte_range(range_str)?;
+
+                let (range_start, range_end) = match range {
+                    Some((start, end)) => (start, end),
+                    None => return Err(anyhow!("Invalid byte range")),
+                };
+
+                let bytes = storage
+                    .get_byte_range(
+                        UPLOADS_BUCKET_NAME,
+                        object_key
+                            .as_ref()
+                            .ok_or_else(|| anyhow!("Object key is missing"))?,
+                        range_start,
+                        range_end,
+                    )
+                    .await?;
+                Ok(res.body(Full::new(bytes)).unwrap())
+            }
+            (&Method::POST, UPLOAD_PATH) => {
+                if let Some(object_key) = object_key {
+                    let (tx, rx) = mpsc::channel(1);
+
+                    tokio::task::spawn(async move {
+                        if let Err(e) = storage.upload(UPLOADS_BUCKET_NAME, &object_key, rx).await {
+                            error!("Error during upload: {:?}", e);
+                        }
+                    });
+
+                    let body = req.into_body();
+                    let mut body_stream = BodyStream::new(body);
+                    while let Some(result) = body_stream.next().await {
+                        match result {
+                            Ok(frame) => {
+                                if let Some(chunk) = frame.into_data().ok() {
+                                    match tx.send(chunk).await {
+                                        Ok(_) => {}
+                                        Err(e) => {
+                                            error!("error sending: {}", e);
+                                            break;
+                                        }
+                                    }
                                 }
                             }
-                        }
-                        Err(e) => {
-                            error!("Error reading chunk: {:?}", e);
-                            break;
+                            Err(e) => {
+                                error!("Error reading chunk: {:?}", e);
+                                break;
+                            }
                         }
                     }
                 }
-                if let Err(e) = storage.upload(UPLOADS_BUCKET_NAME, &object_key, rx).await {
-                    error!("Error during upload: {:?}", e);
-                }
-            });
 
-            Ok(res.body(Full::new(Bytes::new())).unwrap())
-        } else {
-            Ok(res
+                Ok(res.body(Full::new(Bytes::new())).unwrap())
+            }
+            _ => Ok(res
                 .status(StatusCode::BAD_REQUEST)
                 .body(Full::new(Bytes::new()))
-                .unwrap())
+                .unwrap()),
         }
-    } else {
-        Ok(res.body(Full::new(Bytes::new())).unwrap())
     }
 }
 
 async fn handle_connection_h3(
     req: Request<()>,
     mut stream: RequestStream<h3_quinn::BidiStream<Bytes>, Bytes>,
-    client: reqwest::Client,
+    client: Client,
     idp_port: u16,
     storage: Storage,
-) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+) -> Result<()> {
     let (res, body, object_key) =
         request_handler(req.method(), req.headers(), req.uri(), client, idp_port).await?;
 
-    if let Some(b) = body {
-        stream.send_response(res.body(()).unwrap()).await?;
-        stream.send_data(b).await?;
-    } else if req.method() == Method::POST && req.uri().path() == UPLOAD_PATH {
-        if let Some(object_key) = object_key {
-            let (tx, rx) = broadcast::channel::<Bytes>(100);
-            let storage_clone = storage.clone();
-            while let Ok(Some(mut data)) = stream.recv_data().await {
-                let bytes = data.copy_to_bytes(data.remaining());
-                if tx.send(bytes).is_err() {
-                    break;
-                }
+    match req.method() {
+        &Method::GET => {
+            if let Some(object_key) = object_key {
+                let range_header = req
+                    .headers()
+                    .get("Range")
+                    .ok_or_else(|| anyhow!("Range header missing"))?;
+                let range = parse_byte_range(range_header.to_str()?)?;
+
+                let (range_start, range_end) = match range {
+                    Some((start, end)) => (start, end),
+                    None => return Err(anyhow!("Invalid byte range")),
+                };
+
+                let bytes = storage
+                    .get_byte_range(UPLOADS_BUCKET_NAME, &object_key, range_start, range_end)
+                    .await?;
+                stream.send_response(res.body(()).unwrap()).await?;
+                stream.send_data(bytes).await?;
+            } else {
+                stream
+                    .send_response(res.status(StatusCode::NOT_FOUND).body(()).unwrap())
+                    .await?;
             }
-            if let Err(e) = storage_clone
-                .upload(UPLOADS_BUCKET_NAME, &object_key, rx)
-                .await
-            {
-                error!("Error during upload: {:?}", e);
-            }
-            stream.send_response(res.body(()).unwrap()).await?;
-        } else {
-            stream
-                .send_response(res.status(StatusCode::BAD_REQUEST).body(()).unwrap())
-                .await?;
         }
-    } else {
-        stream.send_response(res.body(()).unwrap()).await?;
+        &Method::POST => {
+            if let Some(object_key) = object_key {
+                let (tx, rx) = mpsc::channel::<Bytes>(1);
+                tokio::spawn(async move {
+                    if let Err(e) = storage.upload(UPLOADS_BUCKET_NAME, &object_key, rx).await {
+                        error!("Error during upload: {:?}", e);
+                    }
+                });
+
+                while let Ok(Some(mut data)) = stream.recv_data().await {
+                    let bytes = data.copy_to_bytes(data.remaining());
+                    if tx.send(bytes).await.is_err() {
+                        break;
+                    }
+                }
+                stream.send_response(res.body(()).unwrap()).await?;
+            } else {
+                stream
+                    .send_response(res.status(StatusCode::BAD_REQUEST).body(()).unwrap())
+                    .await?;
+            }
+        }
+        _ => {
+            stream.send_response(res.body(()).unwrap()).await?;
+        }
     }
+
     stream.finish().await?;
     Ok(())
 }
 
+fn parse_byte_range(range: &str) -> Result<Option<(usize, usize)>> {
+    let parts: Vec<&str> = range.trim_start_matches("bytes=").split('-').collect();
+    if parts.len() == 2 {
+        let start: usize = parts[0].parse()?;
+        let end: usize = parts[1].parse()?;
+        Ok(Some((start, end)))
+    } else {
+        Ok(None)
+    }
+}
+
 fn load_certs(path: &Path) -> io::Result<Vec<CertificateDer<'static>>> {
-    certs(&mut BufReader::new(File::open(path)?)).collect()
+    certs(&mut io::BufReader::new(File::open(path)?)).collect()
 }
 
 fn load_keys(path: &Path) -> io::Result<PrivateKeyDer<'static>> {
-    pkcs8_private_keys(&mut BufReader::new(File::open(path)?))
+    pkcs8_private_keys(&mut io::BufReader::new(File::open(path)?))
         .next()
         .unwrap()
         .map(Into::into)
