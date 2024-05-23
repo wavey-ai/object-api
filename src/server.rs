@@ -18,12 +18,12 @@ use rustls_pemfile::{certs, pkcs8_private_keys};
 use std::net::{Ipv4Addr, SocketAddr};
 use std::path::Path;
 use std::sync::Arc;
-use std::{fs::File, io, io::BufReader};
+use std::{fs::File, io};
 use storage::Storage;
 use svix_ksuid::*;
 use tokio::net::TcpListener;
+use tokio::sync::mpsc;
 use tokio::sync::watch;
-use tokio::sync::{broadcast, mpsc};
 use tokio_rustls::TlsAcceptor;
 use tracing::{error, info};
 
@@ -39,16 +39,24 @@ pub struct ObjectApi {
     client: reqwest::Client,
     idp_port: u16,
     storage: Storage,
+    bucket_prefix: String,
 }
 
 impl ObjectApi {
-    pub fn new(ssl_path: String, ssl_port: u16, idp_port: u16, storage: Storage) -> Self {
+    pub fn new(
+        ssl_path: String,
+        ssl_port: u16,
+        idp_port: u16,
+        storage: Storage,
+        bucket_prefix: String,
+    ) -> Self {
         Self {
             ssl_path,
             ssl_port,
             client: Client::new(),
             idp_port,
             storage,
+            bucket_prefix,
         }
     }
 
@@ -80,13 +88,20 @@ impl ObjectApi {
         let client = self.client.clone();
         let idp_port = self.idp_port;
         let storage = self.storage.clone();
+        let prefix = self.bucket_prefix.clone();
         let srv_h2 = {
             let mut shutdown_signal = rx.clone();
 
             async move {
                 let incoming = TcpListener::bind(&addr).await.unwrap();
                 let service = service_fn(move |req| {
-                    handle_request_h2(req, client.clone(), idp_port, storage.clone())
+                    handle_request_h2(
+                        req,
+                        client.clone(),
+                        idp_port,
+                        storage.clone(),
+                        prefix.to_string(),
+                    )
                 });
 
                 loop {
@@ -151,9 +166,10 @@ impl ObjectApi {
             let server_config = quinn::ServerConfig::with_crypto(Arc::new(tls_config));
             let addr = SocketAddr::new(Ipv4Addr::new(0, 0, 0, 0).into(), self.ssl_port);
             let endpoint = quinn::Endpoint::server(server_config, addr).unwrap();
-
             let client = self.client.clone();
             let storage = self.storage.clone();
+            let prefix = self.bucket_prefix.clone();
+
             let srv_h3 = {
                 let mut shutdown_signal = rx.clone();
 
@@ -168,6 +184,7 @@ impl ObjectApi {
                                     info!("New connection being attempted");
                                     let client = client.clone();
                                     let storage = storage.clone();
+                                    let prefix = prefix.clone();
                                     tokio::spawn(async move {
                                         match new_conn.await {
                                             Ok(conn) => {
@@ -180,8 +197,9 @@ impl ObjectApi {
                                                         Ok(Some((req, stream))) => {
                                                             let client = client.clone();
                                                             let storage = storage.clone();
+                                                            let prefix = prefix.to_string();
                                                             tokio::spawn(async move {
-                                                                if let Err(err) = handle_connection_h3(req, stream, client, idp_port, storage).await {
+                                                                if let Err(err) = handle_connection_h3(req, stream, client, idp_port, storage, prefix).await {
                                                                     error!("Failed to handle connection: {err:?}");
                                                                 }
                                                             });
@@ -287,10 +305,12 @@ async fn handle_request_h2(
     client: Client,
     idp_port: u16,
     storage: Storage,
+    bucket_prefix: String,
 ) -> Result<Response<Full<Bytes>>> {
     let (res, body, object_key) =
         request_handler(req.method(), req.headers(), req.uri(), client, idp_port).await?;
 
+    let bucket = format!("{}-{}", bucket_prefix, UPLOADS_BUCKET_NAME);
     let keys: Vec<&str> = req
         .uri()
         .path()
@@ -319,7 +339,7 @@ async fn handle_request_h2(
 
                 let bytes = storage
                     .get_byte_range(
-                        UPLOADS_BUCKET_NAME,
+                        &bucket,
                         object_key
                             .as_ref()
                             .ok_or_else(|| anyhow!("Object key is missing"))?,
@@ -334,7 +354,7 @@ async fn handle_request_h2(
                     let (tx, rx) = mpsc::channel(1);
 
                     tokio::task::spawn(async move {
-                        if let Err(e) = storage.upload(UPLOADS_BUCKET_NAME, &object_key, rx).await {
+                        if let Err(e) = storage.upload(&bucket, &object_key, rx).await {
                             error!("Error during upload: {:?}", e);
                         }
                     });
@@ -378,10 +398,12 @@ async fn handle_connection_h3(
     client: Client,
     idp_port: u16,
     storage: Storage,
+    bucket_prefix: String,
 ) -> Result<()> {
-    let (res, body, object_key) =
+    let (res, _, object_key) =
         request_handler(req.method(), req.headers(), req.uri(), client, idp_port).await?;
 
+    let bucket = format!("{}-{}", bucket_prefix, UPLOADS_BUCKET_NAME);
     match req.method() {
         &Method::GET => {
             if let Some(object_key) = object_key {
@@ -397,7 +419,7 @@ async fn handle_connection_h3(
                 };
 
                 let bytes = storage
-                    .get_byte_range(UPLOADS_BUCKET_NAME, &object_key, range_start, range_end)
+                    .get_byte_range(&bucket, &object_key, range_start, range_end)
                     .await?;
                 stream.send_response(res.body(()).unwrap()).await?;
                 stream.send_data(bytes).await?;
@@ -411,7 +433,7 @@ async fn handle_connection_h3(
             if let Some(object_key) = object_key {
                 let (tx, rx) = mpsc::channel::<Bytes>(1);
                 tokio::spawn(async move {
-                    if let Err(e) = storage.upload(UPLOADS_BUCKET_NAME, &object_key, rx).await {
+                    if let Err(e) = storage.upload(&bucket, &object_key, rx).await {
                         error!("Error during upload: {:?}", e);
                     }
                 });

@@ -95,7 +95,7 @@ pub(crate) fn verify_presigned_url(params: &str) -> Result<String, VerificationE
     mac.update(to_sign.as_bytes());
     let expected_signature = URL_SAFE.encode(mac.finalize().into_bytes());
 
-    if (expected_signature != signature) {
+    if expected_signature != signature {
         Err(VerificationError::BadSignature)
     } else {
         Ok(file_path)
