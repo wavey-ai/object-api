@@ -11,20 +11,15 @@ use hyper::service::service_fn;
 use hyper_idp::client::get_profile;
 use hyper_util::rt::{TokioExecutor, TokioIo};
 use hyper_util::server::conn::auto::Builder as ConnectionBuilder;
-use pki_types::{CertificateDer, PrivateKeyDer};
 use reqwest::Client;
-use rustls::{Certificate, PrivateKey};
-use rustls_pemfile::{certs, pkcs8_private_keys};
 use std::net::{Ipv4Addr, SocketAddr};
-use std::path::Path;
 use std::sync::Arc;
-use std::{fs::File, io};
 use storage::Storage;
 use svix_ksuid::*;
+use tls_helpers::{certs_from_base64, privkey_from_base64, tls_acceptor_from_base64};
 use tokio::net::TcpListener;
 use tokio::sync::mpsc;
 use tokio::sync::watch;
-use tokio_rustls::TlsAcceptor;
 use tracing::{error, info};
 
 const EXPIRY_SECONDS: u64 = 3600;
@@ -34,8 +29,9 @@ const UPLOADS_BUCKET_NAME: &str = "uploads";
 const UP_PATH: &str = "up";
 
 pub struct ObjectApi {
+    cert_pem_base64: String,
+    privkey_pem_base64: String,
     ssl_port: u16,
-    ssl_path: String,
     client: reqwest::Client,
     idp_port: u16,
     storage: Storage,
@@ -44,14 +40,16 @@ pub struct ObjectApi {
 
 impl ObjectApi {
     pub fn new(
-        ssl_path: String,
+        cert_pem_base64: String,
+        privkey_pem_base64: String,
         ssl_port: u16,
         idp_port: u16,
         storage: Storage,
         bucket_prefix: String,
     ) -> Self {
         Self {
-            ssl_path,
+            cert_pem_base64,
+            privkey_pem_base64,
             ssl_port,
             client: Client::new(),
             idp_port,
@@ -67,21 +65,8 @@ impl ObjectApi {
 
         let addr = SocketAddr::new(Ipv4Addr::new(0, 0, 0, 0).into(), self.ssl_port);
 
-        let crt_path = format!("{}/{}", self.ssl_path, "fullchain.pem");
-        let key_path = format!("{}/{}", self.ssl_path, "privkey.pem");
-
-        let crt_path = Path::new(&crt_path);
-        let key_path = Path::new(&key_path);
-
-        let certs = load_certs(crt_path)?;
-        let key = load_keys(key_path)?;
-
-        let mut server_config = tokio_rustls::rustls::ServerConfig::builder()
-            .with_no_client_auth()
-            .with_single_cert(certs, key)?;
-        server_config.alpn_protocols =
-            vec![b"h2".to_vec(), b"http/1.1".to_vec(), b"http/1.0".to_vec()];
-        let tls_acceptor = TlsAcceptor::from(Arc::new(server_config));
+        let tls_acceptor =
+            tls_acceptor_from_base64(&self.cert_pem_base64, &self.privkey_pem_base64)?;
 
         info!("object server up at https://{}", addr);
 
@@ -138,19 +123,15 @@ impl ObjectApi {
         tokio::spawn(srv_h2);
 
         {
-            let certs = Certificate(
-                std::fs::read(format!("{}/{}", self.ssl_path, "fullchain.der")).unwrap(),
-            );
-            let key =
-                PrivateKey(std::fs::read(format!("{}/{}", self.ssl_path, "privkey.der")).unwrap());
-
+            let certs = certs_from_base64(&self.cert_pem_base64)?;
+            let key = privkey_from_base64(&self.privkey_pem_base64)?;
             let mut tls_config = rustls::ServerConfig::builder()
                 .with_safe_default_cipher_suites()
                 .with_safe_default_kx_groups()
                 .with_protocol_versions(&[&rustls::version::TLS13])
                 .unwrap()
                 .with_no_client_auth()
-                .with_single_cert(vec![certs], key)
+                .with_single_cert(certs, key)
                 .unwrap();
 
             tls_config.max_early_data_size = u32::MAX;
@@ -469,15 +450,4 @@ fn parse_byte_range(range: &str) -> Result<Option<(usize, usize)>> {
     } else {
         Ok(None)
     }
-}
-
-fn load_certs(path: &Path) -> io::Result<Vec<CertificateDer<'static>>> {
-    certs(&mut io::BufReader::new(File::open(path)?)).collect()
-}
-
-fn load_keys(path: &Path) -> io::Result<PrivateKeyDer<'static>> {
-    pkcs8_private_keys(&mut io::BufReader::new(File::open(path)?))
-        .next()
-        .unwrap()
-        .map(Into::into)
 }

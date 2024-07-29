@@ -19,9 +19,7 @@ regex = "1.10.2"
 http-body-util = "0.1.1"
 rustls = { version = "0.21.0", features = ["quic"] }
 tokio-rustls = "0.26.0"
-rustls-pemfile = "2"
 xxhash-rust = { version = "0.8.10", features = ["xxh3", "const_xxh3"] }
-pki-types = { package = "rustls-pki-types", version = "1.4.1" }
 jsonwebtoken = "9.3.0"
 serde_json = "1.0.117"
 cookie = "0.18.1"
@@ -32,8 +30,7 @@ quinn = { version = "0.10", default-features = false, features = [
   "ring",
 ] }
 h3 = { git = "https://github.com/hyperium/h3.git", rev = "eb79204" }
-storage = { git = "https://github.com/wavey-ai/storage" }
-#storage = { path = "../storage" }
+storage = { path = "../storage" }
 futures = "0.3.30"
 hmac = "0.12.1"
 sha2 = "0.10.8"
@@ -42,3 +39,4 @@ url = "2.5.0"
 thiserror = "1.0.61"
 svix-ksuid = "0.8.0"
 anyhow = "1.0.86"
+tls-helpers = { path = "../tls-helpers" }
