@@ -74,7 +74,6 @@ checksum = "1505bd5d3d116872e7271a6d4e16d81d0c8570876c8de68093a09ac269d8aac0"
 [[package]]
 name = "au"
 version = "0.1.0"
-source = "git+http://github.com/wavey-ai/au.git#644a58e32e792ee2745f6f50e1e5d7bf53f35cac"
 dependencies = [
  "bytes",
  "chrono",
@@ -1284,7 +1283,6 @@ dependencies = [
 [[package]]
 name = "hyper-idp"
 version = "0.1.0"
-source = "git+https://github.com/wavey-ai/hyper-idp#1ce7bdd0e8ff2a98bd8886f0c3bb5de0603fe4df"
 dependencies = [
  "bytes",
  "cookie",
@@ -1299,13 +1297,11 @@ dependencies = [
  "regex",
  "reqwest",
  "rustls 0.21.12",
- "rustls-pemfile 2.1.2",
- "rustls-pki-types",
  "serde",
  "serde_json",
  "serde_urlencoded",
+ "tls-helpers",
  "tokio",
- "tokio-rustls 0.26.0",
  "tracing",
  "xxhash-rust",
 ]
@@ -2580,7 +2576,7 @@ checksum = "1f3ccbac311fea05f86f61904b462b55fb3df8837a366dfc601a0161d0532f20"
 
 [[package]]
 name = "tls-helpers"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "base64 0.22.1",
  "rustls 0.21.12",

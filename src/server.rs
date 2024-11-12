@@ -66,7 +66,7 @@ impl ObjectApi {
         let addr = SocketAddr::new(Ipv4Addr::new(0, 0, 0, 0).into(), self.ssl_port);
 
         let tls_acceptor =
-            tls_acceptor_from_base64(&self.cert_pem_base64, &self.privkey_pem_base64)?;
+            tls_acceptor_from_base64(&self.cert_pem_base64, &self.privkey_pem_base64, false, true)?;
 
         info!("object server up at https://{}", addr);
 
