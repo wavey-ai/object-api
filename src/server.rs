@@ -333,7 +333,7 @@ async fn handle_request_h2(
             };
 
             if let Some((bytes, hash)) =
-                get_object(Arc::new(storage), &bucket, &key, range_start, range_end).await
+                get_object(storage, &bucket, &key, range_start, range_end).await
             {
                 let etag = format!("\"{:x}\"", hash);
                 Ok(res.header("ETag", etag).body(Full::new(bytes)).unwrap())
@@ -411,7 +411,7 @@ async fn handle_connection_h3(
             };
 
             if let Some((bytes, hash)) =
-                get_object(Arc::new(storage), &bucket, &key, range_start, range_end).await
+                get_object(storage, &bucket, &key, range_start, range_end).await
             {
                 let etag = format!("\"{:x}\"", hash);
                 res = res.header("ETag", etag);

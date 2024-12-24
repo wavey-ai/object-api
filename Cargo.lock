@@ -1235,6 +1235,7 @@ dependencies = [
 [[package]]
 name = "hyper-idp"
 version = "0.1.0"
+source = "git+https://github.com/wavey-ai/hyper-idp.git#743b37d09a2984a17fff36555fe36b43541a3c3a"
 dependencies = [
  "bytes",
  "cookie",
