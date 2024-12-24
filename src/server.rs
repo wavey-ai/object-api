@@ -302,7 +302,7 @@ async fn handle_request_h2(
     req: Request<Incoming>,
     client: Client,
     idp_port: u16,
-    storage: Storage,
+    storage: Arc<Storage>,
 ) -> Result<Response<Full<Bytes>>> {
     let (res, body, bucket_obj) =
         request_handler(req.method(), req.headers(), req.uri(), client, idp_port).await?;
@@ -380,7 +380,7 @@ async fn handle_connection_h3(
     mut stream: RequestStream<h3_quinn::BidiStream<Bytes>, Bytes>,
     client: Client,
     idp_port: u16,
-    storage: Storage,
+    storage: Arc<Storage>,
 ) -> Result<()> {
     let (mut res, _, bucket_obj) =
         request_handler(req.method(), req.headers(), req.uri(), client, idp_port).await?;
