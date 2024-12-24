@@ -34,7 +34,7 @@ pub struct ObjectApi {
     ssl_port: u16,
     client: reqwest::Client,
     idp_port: u16,
-    storage: Storage,
+    storage: Arc<Storage>,
 }
 
 impl ObjectApi {
@@ -43,7 +43,7 @@ impl ObjectApi {
         privkey_pem_base64: String,
         ssl_port: u16,
         idp_port: u16,
-        storage: Storage,
+        storage: Arc<Storage>,
     ) -> Self {
         Self {
             cert_pem_base64,
