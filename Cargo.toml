@@ -29,7 +29,7 @@ quinn = { version = "0.10", default-features = false, features = [
   "ring",
 ] }
 h3 = { git = "https://github.com/hyperium/h3.git", rev = "eb79204" }
-store-stream = { git = "https://github.com/wavey-ai/store-stream.git" }
+store-stream = { git = "ssh://git@github.com/wavey-ai/store-stream.git" }
 futures = "0.3.30"
 hmac = "0.12.1"
 sha2 = "0.10.8"
