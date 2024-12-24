@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-hyper-idp = { path = "../hyper-idp" }
+hyper-idp = { git = "https://github.com/wavey-ai/hyper-idp.git" }
 tokio = { version = "1.37.0", features = ["full"] }
 http = "1.1.0"
 serde = { version = "1.0", features = ["derive"] }
