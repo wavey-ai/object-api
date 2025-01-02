@@ -370,7 +370,7 @@ async fn handle_request_h2(
         (&Method::POST, Some((bucket, key))) => {
             let (tx, rx) = mpsc::channel(1);
             tokio::task::spawn(async move {
-                if let Err(e) = storage.upload(&bucket, &key, rx).await {
+                if let Err(e) = storage.upload(&bucket, &key, rx, 1024 * 100).await {
                     error!("Error during upload: {:?}", e);
                 }
             });
@@ -454,7 +454,7 @@ async fn handle_connection_h3(
         (&Method::POST, Some((bucket, key))) => {
             let (tx, rx) = mpsc::channel::<Bytes>(1);
             tokio::spawn(async move {
-                if let Err(e) = storage.upload(&bucket, &key, rx).await {
+                if let Err(e) = storage.upload(&bucket, &key, rx, 1024 * 100).await {
                     error!("Error during upload: {:?}", e);
                 }
             });
